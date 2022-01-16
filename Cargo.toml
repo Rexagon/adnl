@@ -15,6 +15,3 @@ smallvec = "1.8"
 thiserror = "1.0"
 tl-proto = { version = "0.1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "net", "rt", "time", "io-util", "macros"] }
-
-[dev-dependencies]
-hex = "0.4"

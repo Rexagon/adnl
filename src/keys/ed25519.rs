@@ -77,6 +77,26 @@ impl AsRef<[u8; 32]> for PublicKey {
     }
 }
 
+impl PartialEq for PublicKey {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 .0.eq(&other.0 .0)
+    }
+}
+
+impl Eq for PublicKey {}
+
+impl std::fmt::Debug for PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut output = [0u8; 64];
+        hex::encode_to_slice(&self.0 .0, &mut output).ok();
+
+        // SAFETY: output is guaranteed to contain only [0-9a-f]
+        let output = unsafe { std::str::from_utf8_unchecked(&output) };
+        f.write_str(output)
+    }
+}
+
 pub struct ExpandedSecretKey {
     key: Scalar,
     nonce: [u8; 32],
@@ -186,6 +206,7 @@ mod tests {
                 114, 76, 87, 204, 218, 132, 26, 196, 181, 191, 188, 115, 123
             ]
         );
+        println!("{:?}", pubkey);
 
         let data = b"hello world";
 
