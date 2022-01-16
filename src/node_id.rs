@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use tl_proto::TlWrite;
 
 use crate::keys::ed25519;
 use crate::proto;
@@ -94,5 +95,45 @@ impl ed25519::PublicKey {
         let full_id = AdnlNodeIdFull::new(*self);
         let short_id = full_id.compute_short_id();
         (full_id, short_id)
+    }
+}
+
+pub struct StoredAdnlNodeKey {
+    short_id: AdnlNodeIdShort,
+    full_id: AdnlNodeIdFull,
+    private_key: ed25519::ExpandedSecretKey,
+}
+
+impl StoredAdnlNodeKey {
+    pub fn from_parts(
+        short_id: AdnlNodeIdShort,
+        full_id: AdnlNodeIdFull,
+        private_key: &ed25519::SecretKey,
+    ) -> Self {
+        Self {
+            short_id,
+            full_id,
+            private_key: ed25519::ExpandedSecretKey::from(private_key),
+        }
+    }
+
+    #[inline(always)]
+    pub fn short_id(&self) -> &AdnlNodeIdShort {
+        &self.short_id
+    }
+
+    #[inline(always)]
+    pub fn full_id(&self) -> &AdnlNodeIdFull {
+        &self.full_id
+    }
+
+    #[inline(always)]
+    pub fn private_key_nonce(&self) -> &[u8; 32] {
+        self.private_key.nonce()
+    }
+
+    #[inline(always)]
+    pub fn sign<T: TlWrite>(&self, data: T) -> [u8; 64] {
+        self.private_key.sign(data, &self.full_id.0)
     }
 }

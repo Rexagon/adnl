@@ -1,23 +1,47 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use tokio::net::UdpSocket;
 
-pub fn make_udp_socket(port: u16) -> Result<UdpSocket, SocketError> {
-    let udp_socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))
-        .map_err(SocketError::BindFailed)?;
-    udp_socket
-        .set_nonblocking(true)
-        .map_err(SocketError::ConfigurationFailed)?;
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SocketBuilder {
+    V4,
+    V6,
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
+impl SocketBuilder {
+    pub fn build(self, port: u16) -> Result<UdpSocket, SocketError> {
+        let addr = match self {
+            Self::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Self::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
 
-        let fd = udp_socket.as_raw_fd();
-        maximise_recv_buffer(fd)?;
-        set_reuse_port(fd, true)?;
+        let udp_socket =
+            std::net::UdpSocket::bind((addr, port)).map_err(SocketError::BindFailed)?;
+
+        udp_socket
+            .set_nonblocking(true)
+            .map_err(SocketError::ConfigurationFailed)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+
+            let fd = udp_socket.as_raw_fd();
+            maximise_recv_buffer(fd)?;
+            set_reuse_port(fd, true)?;
+        }
+
+        UdpSocket::from_std(udp_socket).map_err(SocketError::InvalidSocket)
     }
+}
 
-    UdpSocket::from_std(udp_socket).map_err(SocketError::InvalidSocket)
+impl From<SocketBuilder> for IpAddr {
+    fn from(ty: SocketBuilder) -> Self {
+        match ty {
+            SocketBuilder::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketBuilder::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        }
+    }
 }
 
 #[cfg(unix)]
