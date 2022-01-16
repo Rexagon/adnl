@@ -1,0 +1,20 @@
+[package]
+name = "adnl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.1"
+curve25519-dalek-ng = "4.1"
+generic-array = { version = "0.14", features = ["more_lengths"] }
+hex = "0.4"
+libc = "0.2"
+rand = "0.8"
+sha2 = "0.9"
+smallvec = "1.8"
+thiserror = "1.0"
+tl-proto = { version = "0.1", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "net", "rt", "time", "io-util", "macros"] }
+
+[dev-dependencies]
+hex = "0.4"
