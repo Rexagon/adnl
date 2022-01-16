@@ -7,7 +7,9 @@ pub type HashRef<'a> = &'a [u8; 32];
 #[tl(boxed, id = 0xd142cd89)]
 pub struct PacketContents<'tl> {
     #[tl(flags)]
-    pub flags: u32,
+    pub flags: (),
+
+    pub rand1: &'tl [u8],
 
     #[tl(flags_bit = 0)]
     pub from: Option<PublicKey<'tl>>,
@@ -41,6 +43,8 @@ pub struct PacketContents<'tl> {
 
     #[tl(flags_bit = 11, signature)]
     pub signature: Option<&'tl [u8]>,
+
+    pub rand2: &'tl [u8],
 }
 
 #[derive(Debug, Copy, Clone)]
