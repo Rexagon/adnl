@@ -41,7 +41,7 @@ pub struct PacketContents<'tl> {
     #[tl(flags_bit = 10)]
     pub dst_reinit_date: Option<u32>,
 
-    #[tl(flags_bit = 11, signature)]
+    #[tl(flags_bit = 11)]
     pub signature: Option<&'tl [u8]>,
 
     pub rand2: &'tl [u8],

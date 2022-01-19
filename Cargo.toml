@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+aes = { version = "0.7", features = ["ctr"] }
 bytes = "1.1"
 curve25519-dalek-ng = "4.1"
 futures = "0.3"

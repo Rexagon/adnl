@@ -46,11 +46,7 @@ impl PublicKey {
 
     #[inline(always)]
     fn from_scalar(mut bits: [u8; 32]) -> PublicKey {
-        bits[0] &= 248;
-        bits[31] &= 127;
-        bits[31] |= 64;
-
-        let point = &Scalar::from_bits(bits) * &ED25519_BASEPOINT_TABLE;
+        let point = &clamp_scalar(bits) * &ED25519_BASEPOINT_TABLE;
         let compressed = point.compress();
         Self(compressed, -point)
     }
@@ -132,6 +128,12 @@ impl ExpandedSecretKey {
         result[32..].copy_from_slice(s.as_bytes().as_slice());
         result
     }
+
+    #[inline(always)]
+    pub fn compute_shared_secret(&self, other_public_key: &PublicKey) -> [u8; 32] {
+        let point = (-other_public_key.1).to_montgomery();
+        (clamp_scalar(self.key.to_bytes()) * point).to_bytes()
+    }
 }
 
 impl From<&'_ SecretKey> for ExpandedSecretKey {
@@ -176,6 +178,14 @@ impl SecretKey {
     pub fn generate() -> Self {
         Self(rand::thread_rng().gen())
     }
+}
+
+#[inline(always)]
+fn clamp_scalar(mut bits: [u8; 32]) -> Scalar {
+    bits[0] &= 248;
+    bits[31] &= 127;
+    bits[31] |= 64;
+    Scalar::from_bits(bits)
 }
 
 #[inline(always)]
@@ -239,5 +249,19 @@ mod tests {
         let signature = extended.sign(data, &first_pubkey);
 
         assert!(!second_pubkey.verify(&data, &signature))
+    }
+
+    #[test]
+    fn same_shared_secret() {
+        let first = ExpandedSecretKey::from(&SecretKey::generate());
+        let first_pubkey = PublicKey::from(&first);
+
+        let second = ExpandedSecretKey::from(&SecretKey::generate());
+        let second_pubkey = PublicKey::from(&second);
+
+        let first_shared_key = first.compute_shared_secret(&second_pubkey);
+        let second_shared_key = second.compute_shared_secret(&first_pubkey);
+
+        assert_eq!(first_shared_key, second_shared_key);
     }
 }
