@@ -45,7 +45,7 @@ impl PublicKey {
     }
 
     #[inline(always)]
-    fn from_scalar(mut bits: [u8; 32]) -> PublicKey {
+    fn from_scalar(bits: [u8; 32]) -> PublicKey {
         let point = &clamp_scalar(bits) * &ED25519_BASEPOINT_TABLE;
         let compressed = point.compress();
         Self(compressed, -point)
@@ -93,6 +93,7 @@ impl std::fmt::Debug for PublicKey {
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct ExpandedSecretKey {
     key: Scalar,
     nonce: [u8; 32],
@@ -177,6 +178,11 @@ impl SecretKey {
 
     pub fn generate() -> Self {
         Self(rand::thread_rng().gen())
+    }
+
+    #[inline(always)]
+    pub fn expand(&self) -> ExpandedSecretKey {
+        ExpandedSecretKey::from(self)
     }
 }
 

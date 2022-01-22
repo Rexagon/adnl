@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 use tl_proto::TlWrite;
 
 use crate::keys::ed25519;
+use crate::keys::ed25519::ExpandedSecretKey;
 use crate::proto;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -89,6 +90,12 @@ impl AsRef<[u8; 32]> for AdnlNodeIdShort {
     }
 }
 
+impl PartialEq<[u8]> for AdnlNodeIdShort {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.0 == other
+    }
+}
+
 impl ed25519::PublicKey {
     #[inline(always)]
     pub fn compute_node_ids(&self) -> (AdnlNodeIdFull, AdnlNodeIdShort) {
@@ -98,6 +105,7 @@ impl ed25519::PublicKey {
     }
 }
 
+#[derive(Clone)]
 pub struct StoredAdnlNodeKey {
     short_id: AdnlNodeIdShort,
     full_id: AdnlNodeIdFull,
@@ -128,8 +136,8 @@ impl StoredAdnlNodeKey {
     }
 
     #[inline(always)]
-    pub fn private_key_nonce(&self) -> &[u8; 32] {
-        self.private_key.nonce()
+    pub fn private_key(&self) -> &ExpandedSecretKey {
+        &self.private_key
     }
 
     #[inline(always)]

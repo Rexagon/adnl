@@ -14,8 +14,9 @@ pub trait Encoder<Item> {
 
 pub trait Decoder {
     type Item;
+    type Error: std::fmt::Debug;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Option<Self::Item>;
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Self::Item, Self::Error>;
 }
 
 pub struct UdpFramed<C> {
@@ -57,8 +58,11 @@ where
 
         loop {
             if pin.is_readable {
-                if let Some(frame) = pin.codec.decode(&mut pin.rd) {
-                    return Poll::Ready(Some(Ok(frame)));
+                match pin.codec.decode(&mut pin.rd) {
+                    Ok(frame) => return Poll::Ready(Some(Ok(frame))),
+                    Err(e) => {
+                        log::debug!("got invalid packet: {:?}", e);
+                    }
                 }
 
                 pin.is_readable = false;
@@ -163,19 +167,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bytes() {
+    fn bytes_prefix_stays_valid() {
         let mut bytes = BytesMut::with_capacity(4);
         bytes.put_u32(0x11223344);
 
-        let mut prefix = bytes.split_to(2);
+        let prefix = bytes.split_to(2);
 
-        println!("{}", hex::encode(&prefix));
-        println!("{}", hex::encode(&bytes));
+        assert_eq!(prefix.as_ref(), &[0x11, 0x22]);
+        assert_eq!(bytes.as_ref(), &[0x33, 0x44]);
 
         bytes.clear();
         bytes.put_u32(0x55667788);
 
-        println!("{}", hex::encode(&prefix));
-        println!("{}", hex::encode(&bytes));
+        assert_eq!(prefix.as_ref(), &[0x11, 0x22]);
+        assert_eq!(bytes.as_ref(), &[0x55, 0x66, 0x77, 0x88]);
     }
 }
