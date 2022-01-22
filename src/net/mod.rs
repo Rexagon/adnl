@@ -1,13 +1,12 @@
 use aes::cipher::StreamCipher;
 use bytes::{Buf, Bytes, BytesMut};
 use rustc_hash::FxHashMap;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use tl_proto::*;
 
 use crate::channel::*;
 use crate::keys::*;
 use crate::proto;
-use crate::utils::*;
 
 pub use self::address::*;
 
@@ -178,6 +177,55 @@ fn build_packet_cipher(shared_secret: &[u8; 32], checksum: &[u8; 32]) -> aes::Ae
         &generic_array::GenericArray::from(aes_key_bytes),
         &generic_array::GenericArray::from(aes_ctr_bytes),
     )
+}
+
+#[derive(Default)]
+struct PacketHasher {
+    len: usize,
+    h: Sha256,
+}
+
+impl PacketHasher {
+    #[inline(always)]
+    fn hash<T: TlWrite>(packet: &T) -> ([u8; 32], usize) {
+        let mut hasher = Self::default();
+        packet.write_to(&mut hasher);
+        (hasher.h.finalize().into(), hasher.len)
+    }
+}
+
+impl TlPacket for PacketHasher {
+    const TARGET: TlTarget = TlTarget::Hasher;
+
+    #[inline(always)]
+    fn write_u32(&mut self, data: u32) {
+        self.len += 4;
+        self.h.update(&data.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn write_i32(&mut self, data: i32) {
+        self.len += 4;
+        self.h.update(&data.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, data: u64) {
+        self.len += 8;
+        self.h.update(&data.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn write_i64(&mut self, data: i64) {
+        self.len += 8;
+        self.h.update(&data.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn write_raw_slice(&mut self, data: &[u8]) {
+        self.len += data.len();
+        self.h.update(data);
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
