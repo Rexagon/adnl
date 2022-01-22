@@ -5,6 +5,47 @@ use rand::Rng;
 use sha2::{Digest, Sha512};
 use tl_proto::*;
 
+use crate::proto;
+
+#[derive(Copy, Clone)]
+pub struct KeyPair {
+    pub secret_key: ExpandedSecretKey,
+    pub public_key: PublicKey,
+}
+
+impl KeyPair {
+    #[inline(always)]
+    pub fn generate() -> Self {
+        Self::from(&SecretKey::generate())
+    }
+
+    #[inline(always)]
+    pub fn sign<T: TlWrite>(&self, data: T) -> [u8; 64] {
+        self.secret_key.sign(data, &self.public_key)
+    }
+}
+
+impl From<ExpandedSecretKey> for KeyPair {
+    fn from(secret_key: ExpandedSecretKey) -> Self {
+        let public_key = PublicKey::from(&secret_key);
+        Self {
+            secret_key,
+            public_key,
+        }
+    }
+}
+
+impl From<&'_ SecretKey> for KeyPair {
+    fn from(secret_key: &SecretKey) -> Self {
+        let secret_key = secret_key.expand();
+        let public_key = PublicKey::from(&secret_key);
+        Self {
+            secret_key,
+            public_key,
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct PublicKey(CompressedEdwardsY, EdwardsPoint);
 
@@ -14,6 +55,21 @@ impl PublicKey {
         let compressed = CompressedEdwardsY(bytes);
         let point = compressed.decompress()?;
         Some(PublicKey(compressed, -point))
+    }
+
+    #[inline(always)]
+    pub fn from_tl(tl: proto::PublicKey<'_>) -> Option<Self> {
+        match tl {
+            proto::PublicKey::Ed25519 { key } => Self::from_bytes(*key),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_tl(&'_ self) -> proto::PublicKey<'_> {
+        proto::PublicKey::Ed25519 {
+            key: self.0.as_bytes(),
+        }
     }
 
     #[inline(always)]
@@ -62,8 +118,8 @@ impl From<&'_ SecretKey> for PublicKey {
 }
 
 impl From<&'_ ExpandedSecretKey> for PublicKey {
-    fn from(expanded_private_key: &ExpandedSecretKey) -> Self {
-        Self::from_scalar(expanded_private_key.key.to_bytes())
+    fn from(expanded_secret_key: &ExpandedSecretKey) -> Self {
+        Self::from_scalar(expanded_secret_key.key.to_bytes())
     }
 }
 

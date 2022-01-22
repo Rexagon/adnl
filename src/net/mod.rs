@@ -5,8 +5,7 @@ use sha2::Digest;
 use tl_proto::*;
 
 use crate::channel::*;
-use crate::keys::ed25519;
-use crate::node_id::*;
+use crate::keys::*;
 use crate::proto;
 use crate::utils::*;
 
@@ -16,9 +15,9 @@ pub mod address;
 pub mod framed;
 pub mod socket;
 
-pub struct AdnlCodec {
-    keys: FxHashMap<AdnlNodeIdShort, StoredAdnlNodeKey>,
-    channels: FxHashMap<AdnlChannelId, AdnlChannel>,
+pub struct Codec {
+    keys: FxHashMap<NodeId, ed25519::KeyPair>,
+    channels: FxHashMap<ChannelId, Channel>,
 }
 
 #[derive(Copy, Clone)]
@@ -27,7 +26,7 @@ struct PacketToSend<'a> {
     encoder: PacketEncoder<'a>,
 }
 
-impl<'a> framed::Encoder<PacketToSend<'a>> for AdnlCodec {
+impl<'a> framed::Encoder<PacketToSend<'a>> for Codec {
     fn encode(&mut self, item: PacketToSend<'a>, dst: &mut BytesMut) {
         match item.encoder {
             PacketEncoder::Handshake(handshake) => handshake.encode(item.contents, dst),
@@ -36,7 +35,7 @@ impl<'a> framed::Encoder<PacketToSend<'a>> for AdnlCodec {
     }
 }
 
-impl framed::Decoder for AdnlCodec {
+impl framed::Decoder for Codec {
     type Item = Bytes;
     type Error = CodecError;
 
@@ -56,22 +55,22 @@ impl framed::Decoder for AdnlCodec {
 }
 
 #[derive(Copy, Clone)]
-enum PacketEncoder<'a> {
+pub enum PacketEncoder<'a> {
     Handshake(HandshakeEncoder<'a>),
     Channel(ChannelEncoder<'a>),
 }
 
 #[derive(Copy, Clone)]
 pub struct HandshakeEncoder<'a> {
-    peer_id_short: &'a AdnlNodeIdShort,
-    peer_id_full: &'a AdnlNodeIdFull,
+    peer_id_short: &'a NodeId,
+    peer_public_key: &'a ed25519::PublicKey,
 }
 
 impl HandshakeEncoder<'_> {
     pub fn encode<T: TlWrite>(self, packet: &T, buffer: &mut BytesMut) {
-        let temp_private_key = ed25519::SecretKey::generate().expand();
-        let temp_public_key = ed25519::PublicKey::from(&temp_private_key);
-        let shared_secret = temp_private_key.compute_shared_secret(self.peer_id_full.public_key());
+        let temp_secret_key = ed25519::SecretKey::generate().expand();
+        let temp_public_key = ed25519::PublicKey::from(&temp_secret_key);
+        let shared_secret = temp_secret_key.compute_shared_secret(self.peer_public_key);
 
         let (checksum, len) = PacketHasher::hash(packet);
 
@@ -86,13 +85,10 @@ impl HandshakeEncoder<'_> {
 }
 
 #[derive(Copy, Clone)]
-pub struct HandshakeDecoder<'a>(&'a FxHashMap<AdnlNodeIdShort, StoredAdnlNodeKey>);
+pub struct HandshakeDecoder<'a>(&'a FxHashMap<NodeId, ed25519::KeyPair>);
 
 impl<'a> HandshakeDecoder<'a> {
-    pub fn decode(
-        self,
-        buffer: &mut BytesMut,
-    ) -> Result<Option<&'a AdnlNodeIdShort>, HandshakeError> {
+    pub fn decode(self, buffer: &mut BytesMut) -> Result<Option<&'a NodeId>, HandshakeError> {
         if buffer.len() < 96 {
             return Err(HandshakeError::PacketTooSmall);
         }
@@ -106,7 +102,7 @@ impl<'a> HandshakeDecoder<'a> {
 
         for (local_peer_id_short, key) in self.0 {
             if local_peer_id_short == peer_id_short {
-                let shared_secret = key.private_key().compute_shared_secret(&temp_public_key);
+                let shared_secret = key.secret_key.compute_shared_secret(&temp_public_key);
 
                 let checksum: [u8; 32] = buffer[64..96].try_into().unwrap();
                 build_packet_cipher(&shared_secret, &checksum).apply_keystream(&mut buffer[96..]);
@@ -125,7 +121,7 @@ impl<'a> HandshakeDecoder<'a> {
 }
 
 #[derive(Copy, Clone)]
-pub struct ChannelEncoder<'a>(&'a AdnlChannel);
+pub struct ChannelEncoder<'a>(&'a Channel);
 
 impl ChannelEncoder<'_> {
     pub fn encoder<T: TlWrite>(self, packet: &T, buffer: &mut BytesMut) {
@@ -142,10 +138,10 @@ impl ChannelEncoder<'_> {
 }
 
 #[derive(Copy, Clone)]
-pub struct ChannelDecoder<'a>(&'a FxHashMap<AdnlChannelId, AdnlChannel>);
+pub struct ChannelDecoder<'a>(&'a FxHashMap<ChannelId, Channel>);
 
 impl<'a> ChannelDecoder<'a> {
-    pub fn decode(self, buffer: &mut BytesMut) -> Result<&'a AdnlChannel, ChannelError> {
+    pub fn decode(self, buffer: &mut BytesMut) -> Result<&'a Channel, ChannelError> {
         if buffer.len() < 64 {
             return Err(ChannelError::PacketTooSmall);
         }
@@ -161,7 +157,7 @@ impl<'a> ChannelDecoder<'a> {
 
         build_packet_cipher(&channel.incoming().secret, &checksum).apply_keystream(data);
 
-        if sha2::Sha256::digest(data).as_slice() != &checksum {
+        if sha2::Sha256::digest(data).as_slice() != checksum {
             return Err(ChannelError::InvalidChecksum);
         }
 
@@ -185,7 +181,7 @@ fn build_packet_cipher(shared_secret: &[u8; 32], checksum: &[u8; 32]) -> aes::Ae
 }
 
 #[derive(thiserror::Error, Debug)]
-enum CodecError {
+pub enum CodecError {
     #[error("invalid handshake packet")]
     InvalidHandshakePacket(#[from] HandshakeError),
     #[error("invalid channel packet")]
@@ -193,7 +189,7 @@ enum CodecError {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum HandshakeError {
+pub enum HandshakeError {
     #[error("handshake packet too small")]
     PacketTooSmall,
     #[error("invalid public key in handshake packet")]
@@ -203,7 +199,7 @@ enum HandshakeError {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum ChannelError {
+pub enum ChannelError {
     #[error("channel packet too small")]
     PacketTooSmall,
     #[error("channel not found")]

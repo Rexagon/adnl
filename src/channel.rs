@@ -3,26 +3,25 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use sha2::{Digest, Sha256};
 use tl_proto::HashWrapper;
 
-use crate::keys::ed25519;
-use crate::node_id::*;
+use crate::keys::*;
 use crate::proto;
 
-pub type AdnlChannelId = [u8; 32];
+pub type ChannelId = [u8; 32];
 
-pub struct AdnlChannel {
+pub struct Channel {
     ready: AtomicBool,
-    incoming: AdnlChannelSide,
-    outgoing: AdnlChannelSide,
-    local_id: AdnlNodeIdShort,
-    peer_id: AdnlNodeIdShort,
+    incoming: ChannelSide,
+    outgoing: ChannelSide,
+    local_id: NodeId,
+    peer_id: NodeId,
     peer_channel_date: u32,
     drop: AtomicI32,
 }
 
-impl AdnlChannel {
+impl Channel {
     pub fn new(
-        local_id: AdnlNodeIdShort,
-        peer_id: AdnlNodeIdShort,
+        local_id: NodeId,
+        peer_id: NodeId,
         channel_key: &ed25519::ExpandedSecretKey,
         other_public_key: &ed25519::PublicKey,
         peer_channel_date: u32,
@@ -40,8 +39,8 @@ impl AdnlChannel {
 
         Self {
             ready: AtomicBool::new(context == AdnlChannelCreationContext::ConfirmChannel),
-            incoming: AdnlChannelSide::from_secret(in_secret),
-            outgoing: AdnlChannelSide::from_secret(out_secret),
+            incoming: ChannelSide::from_secret(in_secret),
+            outgoing: ChannelSide::from_secret(out_secret),
             local_id,
             peer_id,
             peer_channel_date,
@@ -50,22 +49,22 @@ impl AdnlChannel {
     }
 
     #[inline(always)]
-    pub fn incoming(&self) -> &AdnlChannelSide {
+    pub fn incoming(&self) -> &ChannelSide {
         &self.incoming
     }
 
     #[inline(always)]
-    pub fn outgoing(&self) -> &AdnlChannelSide {
+    pub fn outgoing(&self) -> &ChannelSide {
         &self.outgoing
     }
 
     #[inline(always)]
-    pub fn local_id(&self) -> &AdnlNodeIdShort {
+    pub fn local_id(&self) -> &NodeId {
         &self.local_id
     }
 
     #[inline(always)]
-    pub fn peer_id(&self) -> &AdnlNodeIdShort {
+    pub fn peer_id(&self) -> &NodeId {
         &self.peer_id
     }
 
@@ -80,45 +79,18 @@ impl AdnlChannel {
     }
 }
 
-pub struct AdnlChannelSide {
-    pub id: AdnlChannelId,
+pub struct ChannelSide {
+    pub id: ChannelId,
     pub secret: [u8; 32],
 }
 
-impl AdnlChannelSide {
+impl ChannelSide {
     #[inline(always)]
     fn from_secret(secret: [u8; 32]) -> Self {
         Self {
             id: compute_channel_id(&secret),
             secret,
         }
-    }
-}
-
-pub struct AdnlChannelKey {
-    public_key: ed25519::PublicKey,
-    private_key: ed25519::ExpandedSecretKey,
-}
-
-impl AdnlChannelKey {
-    pub fn generate() -> Self {
-        let private_key = ed25519::SecretKey::generate().expand();
-        let public_key = ed25519::PublicKey::from(&private_key);
-
-        Self {
-            public_key,
-            private_key,
-        }
-    }
-
-    #[inline(always)]
-    pub fn public_key(&self) -> &ed25519::PublicKey {
-        &self.public_key
-    }
-
-    #[inline(always)]
-    pub fn private_key(&self) -> &ed25519::ExpandedSecretKey {
-        &self.private_key
     }
 }
 
@@ -138,7 +110,7 @@ impl std::fmt::Display for AdnlChannelCreationContext {
 }
 
 #[inline(always)]
-fn compute_channel_id(key: &[u8; 32]) -> AdnlChannelId {
+fn compute_channel_id(key: &[u8; 32]) -> ChannelId {
     let mut h = Sha256::new();
     HashWrapper(proto::PublicKey::Aes { key }).update_hasher(&mut h);
     h.finalize().into()

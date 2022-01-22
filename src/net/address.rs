@@ -3,12 +3,12 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use crate::proto;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum AdnlAddress {
+pub enum Address {
     Udp(u32, u16),
     Udp6([u8; 16], u16),
 }
 
-impl AdnlAddress {
+impl Address {
     #[inline(always)]
     pub fn from_tl(tl: proto::Address<'_>) -> Option<Self> {
         match tl {
@@ -60,7 +60,7 @@ impl AdnlAddress {
     }
 }
 
-impl std::fmt::Display for AdnlAddress {
+impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Udp(ip, port) => f.write_fmt(format_args!(
@@ -78,18 +78,18 @@ impl std::fmt::Display for AdnlAddress {
     }
 }
 
-impl From<SocketAddr> for AdnlAddress {
+impl From<SocketAddr> for Address {
     #[inline(always)]
     fn from(addr: SocketAddr) -> Self {
         Self::new(addr)
     }
 }
 
-impl From<AdnlAddress> for SocketAddr {
-    fn from(addr: AdnlAddress) -> Self {
+impl From<Address> for SocketAddr {
+    fn from(addr: Address) -> Self {
         match addr {
-            AdnlAddress::Udp(ip, port) => SocketAddr::V4(SocketAddrV4::new(ip.into(), port)),
-            AdnlAddress::Udp6(ip, port) => SocketAddr::V6(SocketAddrV6::new(ip.into(), port, 0, 0)),
+            Address::Udp(ip, port) => SocketAddr::V4(SocketAddrV4::new(ip.into(), port)),
+            Address::Udp6(ip, port) => SocketAddr::V6(SocketAddrV6::new(ip.into(), port, 0, 0)),
         }
     }
 }
@@ -97,10 +97,10 @@ impl From<AdnlAddress> for SocketAddr {
 pub fn parse_address_list(
     now: u32,
     list: proto::AddressList<'_>,
-) -> Result<AdnlAddress, AddressListError> {
+) -> Result<Address, AddressListError> {
     let address = list
         .address
-        .and_then(AdnlAddress::from_tl)
+        .and_then(Address::from_tl)
         .ok_or(AddressListError::ListIsEmpty)?;
 
     if list.version > now || list.reinit_date > now {
