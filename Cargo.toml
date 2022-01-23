@@ -16,7 +16,7 @@ log = "0.4.14"
 rand = "0.8"
 rustc-hash = "1.1"
 sha2 = "0.9"
-smallvec = "1.8"
+smallvec = { version = "1.8", features = ["const_generics", "union"] }
 thiserror = "1.0"
 tl-proto = { version = "0.1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "net", "rt", "time", "io-util", "macros"] }

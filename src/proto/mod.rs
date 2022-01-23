@@ -3,48 +3,143 @@ use tl_proto::*;
 
 pub type HashRef<'a> = &'a [u8; 32];
 
-#[derive(Debug, Clone, TlRead, TlWrite)]
-#[tl(boxed, id = 0xd142cd89)]
-pub struct PacketContents<'tl> {
-    #[tl(flags)]
-    pub flags: (),
-
+#[derive(Debug, Clone)]
+pub struct OutgoingPacketContents<'tl> {
+    /// 7 or 3 random bytes
     pub rand1: &'tl [u8],
-
-    #[tl(flags_bit = 0)]
     pub from: Option<PublicKey<'tl>>,
-    #[tl(flags_bit = 1)]
-    pub from_short: Option<HashRef<'tl>>,
+    pub messages: SmallVec<[Message<'tl>; 4]>,
+    pub address: AddressList<'tl>,
+    pub seqno: u64,
+    pub confirm_seqno: u64,
+    pub reinit_dates: Option<(u32, u32)>,
+    /// 3 or 7 random bytes
+    pub rand2: &'tl [u8],
+}
 
-    #[tl(flags_bit = 2)]
-    pub message: Option<Message<'tl>>,
-    #[tl(flags_bit = 3)]
-    pub messages: Option<SmallVec<[Message<'tl>; 4]>>,
+impl<'tl> TlWrite for OutgoingPacketContents<'tl> {
+    fn max_size_hint(&self) -> usize {
+        let messages_size = match self.messages.first() {
+            Some(message) if self.messages.len() == 1 => message.max_size_hint(),
+            _ => self.messages.max_size_hint(),
+        };
 
-    #[tl(flags_bit = 4)]
+        8 // rand1 (1 byte length, 7 bytes data)
+        + 4 // flags
+        + self.from.max_size_hint()
+        + messages_size
+        + self.address.max_size_hint()
+        + 8 // seqno
+        + 8 // confirm_seqno
+        + self.reinit_dates.max_size_hint()
+        + 4 // rand2 (1 byte length, 3 bytes data)
+    }
+
+    fn write_to<P>(&self, packet: &mut P)
+    where
+        P: TlPacket,
+    {
+        const DEFAULT_FLAGS: u32 = (0b1 << 4) | (0b1 << 6) | (0b1 << 7);
+
+        let flags = DEFAULT_FLAGS
+            | (self.from.is_some() as u32)
+            | (if self.messages.len() == 1 {
+                0b1 << 2
+            } else {
+                0b1 << 3
+            } | ((self.reinit_dates.is_some() as u32) << 10));
+
+        packet.write_u32(0xd142cd89); // constructor
+        self.rand1.write_to(packet);
+        packet.write_u32(flags);
+        match self.messages.first() {
+            Some(message) if self.messages.len() == 1 => message.write_to(packet),
+            _ => self.messages.write_to(packet),
+        }
+        self.address.write_to(packet);
+        self.seqno.write_to(packet);
+        self.confirm_seqno.write_to(packet);
+        self.reinit_dates.write_to(packet);
+        self.rand2.write_to(packet);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IncomingPacketContents<'tl> {
+    pub from: Option<PublicKey<'tl>>,
+
+    pub messages: SmallVec<[Message<'tl>; 4]>,
     pub address: Option<AddressList<'tl>>,
-    #[tl(flags_bit = 5)]
-    pub priority_address: Option<AddressList<'tl>>,
 
-    #[tl(flags_bit = 6)]
     pub seqno: Option<u64>,
-    #[tl(flags_bit = 7)]
     pub confirm_seqno: Option<u64>,
 
-    #[tl(flags_bit = 8)]
-    pub recv_addr_list_version: Option<u32>,
-    #[tl(flags_bit = 9)]
-    pub recv_priority_addr_list_version: Option<u32>,
+    pub reinit_dates: Option<(u32, u32)>,
+}
 
-    #[tl(flags_bit = 10)]
-    pub reinit_date: Option<u32>,
-    #[tl(flags_bit = 10)]
-    pub dst_reinit_date: Option<u32>,
+impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
+    fn read_from(packet: &'tl [u8], offset: &mut usize) -> TlResult<Self> {
+        #[inline(always)]
+        fn read_optional<'tl, T: TlRead<'tl>, const N: usize>(
+            flags: u32,
+            packet: &'tl [u8],
+            offset: &mut usize,
+        ) -> TlResult<Option<T>> {
+            Ok(if flags & (0b1 << N) != 0 {
+                Some(T::read_from(packet, offset)?)
+            } else {
+                None
+            })
+        }
 
-    #[tl(flags_bit = 11)]
-    pub signature: Option<&'tl [u8]>,
+        if u32::read_from(packet, offset)? != 0xd142cd89 {
+            return Err(TlError::UnknownConstructor);
+        }
 
-    pub rand2: &'tl [u8],
+        <&[u8] as TlRead>::read_from(packet, offset)?; // rand1
+
+        let flags = u32::read_from(packet, offset)?;
+        let from = read_optional::<PublicKey, 0>(flags, packet, offset)?;
+        read_optional::<HashRef, 1>(flags, packet, offset)?; // from_short
+
+        let message = read_optional::<Message, 2>(flags, packet, offset)?;
+        let messages = read_optional::<SmallVec<[Message<'tl>; 4]>, 3>(flags, packet, offset)?;
+
+        let address = read_optional::<AddressList, 4>(flags, packet, offset)?;
+        read_optional::<AddressList, 5>(flags, packet, offset)?; // priority_address
+
+        let seqno = read_optional::<u64, 6>(flags, packet, offset)?;
+        let confirm_seqno = read_optional::<u64, 7>(flags, packet, offset)?;
+
+        read_optional::<u32, 8>(flags, packet, offset)?; // recv_addr_list_version
+        read_optional::<u32, 9>(flags, packet, offset)?; // recv_priority_addr_list_version
+
+        let reinit_dates = read_optional::<(u32, u32), 10>(flags, packet, offset)?;
+
+        read_optional::<&[u8], 11>(flags, packet, offset)?; // signature
+        <&[u8] as TlRead>::read_from(packet, offset)?; // rand2
+
+        Ok(Self {
+            from,
+            messages: match (messages, message) {
+                (Some(messages), None) => messages,
+                (None, Some(message)) => {
+                    let mut messages = SmallVec::with_capacity(1);
+                    messages.push(message);
+                    messages
+                }
+                (Some(mut messages), Some(message)) => {
+                    messages.insert(0, message);
+                    messages
+                }
+                (None, None) => return Err(TlError::UnexpectedEof),
+            },
+            address,
+            seqno,
+            confirm_seqno,
+            reinit_dates,
+        })
+    }
 }
 
 #[derive(Debug, Copy, Clone)]

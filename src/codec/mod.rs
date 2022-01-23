@@ -16,7 +16,7 @@ pub struct Codec {
 
 #[derive(Copy, Clone)]
 struct PacketToSend<'a> {
-    contents: &'a proto::PacketContents<'a>,
+    contents: &'a proto::OutgoingPacketContents<'a>,
     encoder: PacketEncoder<'a>,
 }
 
