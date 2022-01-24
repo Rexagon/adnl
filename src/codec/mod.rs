@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aes::cipher::StreamCipher;
 use bytes::{Buf, Bytes, BytesMut};
 use rustc_hash::FxHashMap;
@@ -6,12 +8,127 @@ use tl_proto::*;
 
 use crate::channel::*;
 use crate::keys::*;
+use crate::net::address::*;
 use crate::net::{Decoder, Encoder};
+use crate::peer::*;
 use crate::proto;
 
+pub struct CodecOptions {
+    pub clock_tolerance_sec: u32,
+    pub packet_history_enabled: bool,
+}
+
+impl Default for CodecOptions {
+    fn default() -> Self {
+        Self {
+            clock_tolerance_sec: 60,
+            packet_history_enabled: false,
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct Codec {
+    options: CodecOptions,
     keys: FxHashMap<NodeId, ed25519::KeyPair>,
-    channels: FxHashMap<ChannelId, Channel>,
+    peers: FxHashMap<NodeId, LocalPeerConnections>,
+    channels_by_id: FxHashMap<ChannelId, Arc<Channel>>,
+}
+
+impl Codec {
+    fn process_packet(
+        &mut self,
+        now: u32,
+        packet: proto::IncomingPacketContents<'_>,
+        local_id: &NodeId,
+        source: PacketSource,
+    ) -> Result<Option<NodeId>, ValidationError> {
+        let (from_channel, peer_id) = match (source, packet.from, packet.from_short) {
+            // Packet from channel
+            (PacketSource::Channel(peer_id), None, None) => (true, peer_id),
+            // Invalid packet from channel
+            (PacketSource::Channel(_), _, _) => {
+                return Err(ValidationError::ExplicitSourceForChannel)
+            }
+            // Handshake packet with `from` field
+            (PacketSource::Handshake, Some(public_key), from_short) => {
+                let public_key = ed25519::PublicKey::from_tl(public_key)
+                    .ok_or(ValidationError::InvalidPeerPublicKey)?;
+                let peer_id = NodeId::from(public_key);
+
+                if matches!(from_short, Some(id) if peer_id.as_bytes() != id) {
+                    return Err(ValidationError::PeerIdMismatch);
+                }
+
+                if let Some(list) = packet.address {
+                    let ip_address = parse_address_list(now, list)?;
+                    // TODO: add peer
+                }
+
+                (false, peer_id)
+            }
+            // Handshake packet with only `from_short` field
+            (PacketSource::Handshake, None, Some(peer_id)) => (false, NodeId::new(*peer_id)),
+            // Strange packet without and peer info
+            (PacketSource::Handshake, None, None) => {
+                return Err(ValidationError::NoPeerDataInPacket)
+            }
+        };
+
+        let connections = match self.peers.get_mut(local_id) {
+            Some(peers) => peers,
+            None => self.peers.entry(*local_id).or_default(),
+        };
+        let peer = if from_channel {
+            if connections.channels_by_peers.contains_key(&peer_id) {
+                connections.peers.get_mut(&peer_id)
+            } else {
+                return Err(ValidationError::PeerChannelNotFound);
+            }
+        } else {
+            connections.peers.get_mut(&peer_id)
+        }
+        .ok_or(ValidationError::PeerNotFound)?;
+
+        if let Some((peer_reinit_date, local_reinit_date)) = packet.reinit_dates {
+            if local_reinit_date != 0 {
+                match local_reinit_date.cmp(&peer.incoming_state().reinit_date) {
+                    std::cmp::Ordering::Equal => { /* do nothing */ }
+                    std::cmp::Ordering::Greater => {
+                        return Err(ValidationError::LocalReinitDateTooNew)
+                    }
+                    std::cmp::Ordering::Less => {
+                        // TODO: send message with NOP
+                        return Err(ValidationError::LocalReinitDateTooOld);
+                    }
+                }
+            }
+
+            match peer_reinit_date.cmp(&peer.outgoing_state().reinit_date) {
+                std::cmp::Ordering::Equal => { /* do nothing */ }
+                std::cmp::Ordering::Greater => {
+                    if peer.outgoing_state().reinit_date > now + self.options.clock_tolerance_sec {
+                        return Err(ValidationError::PeerReinitDateTooNew);
+                    }
+                    peer.outgoing_state_mut().reinit_date = peer_reinit_date;
+                    // TODO: reset packet history
+                }
+                std::cmp::Ordering::Less => return Err(ValidationError::PeerReinitDateTooOld),
+            }
+        }
+
+        if let Some(confirm_seqno) = packet.confirm_seqno {
+            // TODO: check sender history seqno
+        }
+
+        Ok(Some(peer_id))
+    }
+}
+
+#[derive(Default)]
+struct LocalPeerConnections {
+    peers: FxHashMap<NodeId, Peer>,
+    channels_by_peers: FxHashMap<NodeId, Arc<Channel>>,
 }
 
 #[derive(Copy, Clone)]
@@ -37,15 +154,23 @@ impl Decoder for Codec {
         let (local_id, peer_id) = match HandshakeDecoder(&self.keys).decode(src)? {
             Some(local_id) => (local_id, None),
             None => {
-                let channel = ChannelDecoder(&self.channels).decode(src)?;
+                let channel = ChannelDecoder(&self.channels_by_id).decode(src)?;
                 channel.set_ready();
                 channel.reset_drop_timeout();
                 (channel.local_id(), Some(channel.peer_id()))
             }
         };
 
+        let packet = tl_proto::deserialize::<proto::IncomingPacketContents>(src);
+
         todo!()
     }
+}
+
+#[derive(Copy, Clone)]
+enum PacketSource {
+    Handshake,
+    Channel(NodeId),
 }
 
 #[derive(Copy, Clone)]
@@ -132,7 +257,7 @@ impl ChannelEncoder<'_> {
 }
 
 #[derive(Copy, Clone)]
-pub struct ChannelDecoder<'a>(&'a FxHashMap<ChannelId, Channel>);
+pub struct ChannelDecoder<'a>(&'a FxHashMap<ChannelId, Arc<Channel>>);
 
 impl<'a> ChannelDecoder<'a> {
     pub fn decode(self, buffer: &mut BytesMut) -> Result<&'a Channel, ChannelError> {
@@ -144,7 +269,8 @@ impl<'a> ChannelDecoder<'a> {
         let channel = self
             .0
             .get(channel_id)
-            .ok_or(ChannelError::ChannelNotFound)?;
+            .ok_or(ChannelError::ChannelNotFound)?
+            .as_ref();
 
         let checksum: [u8; 32] = buffer[32..64].try_into().unwrap();
         let data = &mut buffer[64..];
@@ -225,10 +351,38 @@ impl TlPacket for PacketHasher {
 
 #[derive(thiserror::Error, Debug)]
 pub enum CodecError {
+    #[error("invalid packet")]
+    InvalidPacket(ValidationError),
     #[error("invalid handshake packet")]
     InvalidHandshakePacket(#[from] HandshakeError),
     #[error("invalid channel packet")]
     InvalidChannelPacket(#[from] ChannelError),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ValidationError {
+    #[error("explicit source public key inside channel packet")]
+    ExplicitSourceForChannel,
+    #[error("invalid peer public key")]
+    InvalidPeerPublicKey,
+    #[error("invalid address list")]
+    InvalidAddressList(#[from] AddressListError),
+    #[error("peer id mismatch (from / from_short)")]
+    PeerIdMismatch,
+    #[error("no peer data in packet")]
+    NoPeerDataInPacket,
+    #[error("peer channel not found")]
+    PeerChannelNotFound,
+    #[error("peer not found")]
+    PeerNotFound,
+    #[error("local reinit date is too new")]
+    LocalReinitDateTooNew,
+    #[error("local reinit date is too old")]
+    LocalReinitDateTooOld,
+    #[error("peer reinit date is too old")]
+    PeerReinitDateTooOld,
+    #[error("peer reinit date is too new")]
+    PeerReinitDateTooNew,
 }
 
 #[derive(thiserror::Error, Debug)]

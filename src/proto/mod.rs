@@ -67,6 +67,7 @@ impl<'tl> TlWrite for OutgoingPacketContents<'tl> {
 #[derive(Debug, Clone)]
 pub struct IncomingPacketContents<'tl> {
     pub from: Option<PublicKey<'tl>>,
+    pub from_short: Option<HashRef<'tl>>,
 
     pub messages: SmallVec<[Message<'tl>; 4]>,
     pub address: Option<AddressList<'tl>>,
@@ -100,7 +101,7 @@ impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
 
         let flags = u32::read_from(packet, offset)?;
         let from = read_optional::<PublicKey, 0>(flags, packet, offset)?;
-        read_optional::<HashRef, 1>(flags, packet, offset)?; // from_short
+        let from_short = read_optional::<HashRef, 1>(flags, packet, offset)?;
 
         let message = read_optional::<Message, 2>(flags, packet, offset)?;
         let messages = read_optional::<SmallVec<[Message<'tl>; 4]>, 3>(flags, packet, offset)?;
@@ -121,6 +122,7 @@ impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
 
         Ok(Self {
             from,
+            from_short,
             messages: match (messages, message) {
                 (Some(messages), None) => messages,
                 (None, Some(message)) => {
