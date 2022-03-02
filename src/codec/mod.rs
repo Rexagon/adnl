@@ -1,134 +1,97 @@
+use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use aes::cipher::StreamCipher;
 use bytes::{Buf, Bytes, BytesMut};
+use dashmap::DashMap;
+use everscale_crypto::ed25519;
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use tl_proto::*;
 
 use crate::channel::*;
-use crate::keys::*;
-use crate::net::address::*;
-use crate::net::{Decoder, Encoder};
+use crate::node_id::*;
 use crate::peer::*;
-use crate::proto;
+use crate::{net, proto};
 
+pub struct CodecState {
+    pub options: CodecOptions,
+    /// Initialization timestamp
+    pub reinit_date: u32,
+    /// Maps local keys to remote peers
+    pub connections: RwLock<FxHashMap<NodeId, ConnectionsEntry>>,
+    /// Channels between local and remote peers
+    pub channels_by_id: FxDashMap<ChannelId, Arc<Channel>>,
+}
+
+impl CodecState {
+    pub fn get_peer(&self, local_id: &NodeId, peer_id: &NodeId) -> Result<Arc<Peer>, CodecError> {
+        let connections = self.connections.read();
+
+        let entry = connections
+            .get(local_id)
+            .ok_or(CodecError::LocalPeerNotFound)?;
+
+        let entry = entry.peers.get(peer_id).ok_or(CodecError::PeerNotFound)?;
+
+        Ok(entry.value().clone())
+    }
+
+    pub fn update_peer(
+        &self,
+        local_id: &NodeId,
+        peer_id: &NodeId,
+        public_key: &ed25519::PublicKey,
+        address: net::Address,
+    ) -> Result<Arc<Peer>, CodecError> {
+        use dashmap::mapref::entry::Entry;
+
+        let connections = self.connections.read();
+
+        let entry = connections
+            .get(local_id)
+            .ok_or(CodecError::LocalPeerNotFound)?;
+
+        let peer = match entry.peers.entry(*peer_id) {
+            Entry::Occupied(entry) => {
+                let peer = entry.get().clone();
+
+                // Drop entry lock before address update to prevent locks overlap
+                drop(entry);
+
+                peer.set_address(address);
+                peer
+            }
+            Entry::Vacant(entry) => entry
+                .insert(Arc::new(Peer::new(address, *public_key, self.reinit_date)))
+                .clone(),
+        };
+
+        Ok(peer)
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
 pub struct CodecOptions {
     pub clock_tolerance_sec: u32,
-    pub packet_history_enabled: bool,
 }
 
 impl Default for CodecOptions {
     fn default() -> Self {
         Self {
             clock_tolerance_sec: 60,
-            packet_history_enabled: false,
         }
     }
 }
 
-#[derive(Default)]
-pub struct Codec {
-    options: CodecOptions,
-    keys: FxHashMap<NodeId, ed25519::KeyPair>,
-    peers: FxHashMap<NodeId, LocalPeerConnections>,
-    channels_by_id: FxHashMap<ChannelId, Arc<Channel>>,
-}
-
-impl Codec {
-    fn process_packet(
-        &mut self,
-        now: u32,
-        packet: proto::IncomingPacketContents<'_>,
-        local_id: &NodeId,
-        source: PacketSource,
-    ) -> Result<Option<NodeId>, ValidationError> {
-        let (from_channel, peer_id) = match (source, packet.from, packet.from_short) {
-            // Packet from channel
-            (PacketSource::Channel(peer_id), None, None) => (true, peer_id),
-            // Invalid packet from channel
-            (PacketSource::Channel(_), _, _) => {
-                return Err(ValidationError::ExplicitSourceForChannel)
-            }
-            // Handshake packet with `from` field
-            (PacketSource::Handshake, Some(public_key), from_short) => {
-                let public_key = ed25519::PublicKey::from_tl(public_key)
-                    .ok_or(ValidationError::InvalidPeerPublicKey)?;
-                let peer_id = NodeId::from(public_key);
-
-                if matches!(from_short, Some(id) if peer_id.as_bytes() != id) {
-                    return Err(ValidationError::PeerIdMismatch);
-                }
-
-                if let Some(list) = packet.address {
-                    let ip_address = parse_address_list(now, list)?;
-                    // TODO: add peer
-                }
-
-                (false, peer_id)
-            }
-            // Handshake packet with only `from_short` field
-            (PacketSource::Handshake, None, Some(peer_id)) => (false, NodeId::new(*peer_id)),
-            // Strange packet without and peer info
-            (PacketSource::Handshake, None, None) => {
-                return Err(ValidationError::NoPeerDataInPacket)
-            }
-        };
-
-        let connections = match self.peers.get_mut(local_id) {
-            Some(peers) => peers,
-            None => self.peers.entry(*local_id).or_default(),
-        };
-        let peer = if from_channel {
-            if connections.channels_by_peers.contains_key(&peer_id) {
-                connections.peers.get_mut(&peer_id)
-            } else {
-                return Err(ValidationError::PeerChannelNotFound);
-            }
-        } else {
-            connections.peers.get_mut(&peer_id)
-        }
-        .ok_or(ValidationError::PeerNotFound)?;
-
-        if let Some((peer_reinit_date, local_reinit_date)) = packet.reinit_dates {
-            if local_reinit_date != 0 {
-                match local_reinit_date.cmp(&peer.incoming_state().reinit_date) {
-                    std::cmp::Ordering::Equal => { /* do nothing */ }
-                    std::cmp::Ordering::Greater => {
-                        return Err(ValidationError::LocalReinitDateTooNew)
-                    }
-                    std::cmp::Ordering::Less => {
-                        // TODO: send message with NOP
-                        return Err(ValidationError::LocalReinitDateTooOld);
-                    }
-                }
-            }
-
-            match peer_reinit_date.cmp(&peer.outgoing_state().reinit_date) {
-                std::cmp::Ordering::Equal => { /* do nothing */ }
-                std::cmp::Ordering::Greater => {
-                    if peer.outgoing_state().reinit_date > now + self.options.clock_tolerance_sec {
-                        return Err(ValidationError::PeerReinitDateTooNew);
-                    }
-                    peer.outgoing_state_mut().reinit_date = peer_reinit_date;
-                    // TODO: reset packet history
-                }
-                std::cmp::Ordering::Less => return Err(ValidationError::PeerReinitDateTooOld),
-            }
-        }
-
-        if let Some(confirm_seqno) = packet.confirm_seqno {
-            // TODO: check sender history seqno
-        }
-
-        Ok(Some(peer_id))
-    }
-}
-
-#[derive(Default)]
-struct LocalPeerConnections {
-    peers: FxHashMap<NodeId, Peer>,
-    channels_by_peers: FxHashMap<NodeId, Arc<Channel>>,
+pub struct ConnectionsEntry {
+    /// Local key
+    pub key: ed25519::KeyPair,
+    /// Remote peers
+    pub peers: FxDashMap<NodeId, Arc<Peer>>,
+    /// Peer channels
+    pub channels_by_peers: FxDashMap<NodeId, Arc<Channel>>,
 }
 
 #[derive(Copy, Clone)]
@@ -137,40 +100,31 @@ struct PacketToSend<'a> {
     encoder: PacketEncoder<'a>,
 }
 
-impl<'a> Encoder<PacketToSend<'a>> for Codec {
-    fn encode(&mut self, item: PacketToSend<'a>, dst: &mut BytesMut) {
-        match item.encoder {
-            PacketEncoder::Handshake(handshake) => handshake.encode(item.contents, dst),
-            PacketEncoder::Channel(channel) => channel.encoder(item.contents, dst),
-        }
-    }
-}
+// impl<'a> Encoder<PacketToSend<'a>> for Codec {
+//     fn encode(&mut self, item: PacketToSend<'a>, dst: &mut BytesMut) {
+//         match item.encoder {
+//             PacketEncoder::Handshake(handshake) => handshake.encode(item.contents, dst),
+//             PacketEncoder::Channel(channel) => channel.encoder(item.contents, dst),
+//         }
+//     }
+// }
 
-impl Decoder for Codec {
-    type Item = Bytes;
-    type Error = CodecError;
+// impl net::Decoder for Codec {
+//     type Item = DecodedPacket;
+//     type Error = CodecError;
+//
+//     fn decode(&mut self, src: &mut BytesMut) -> Result<Self::Item, CodecError> {
+//         match HandshakeDecoder(&self.keys).decode(src)? {
+//             Some(packet) => Ok(packet),
+//             None => ChannelDecoder(&self.channels_by_id).decode(src),
+//         }
+//     }
+// }
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Self::Item, CodecError> {
-        let (local_id, peer_id) = match HandshakeDecoder(&self.keys).decode(src)? {
-            Some(local_id) => (local_id, None),
-            None => {
-                let channel = ChannelDecoder(&self.channels_by_id).decode(src)?;
-                channel.set_ready();
-                channel.reset_drop_timeout();
-                (channel.local_id(), Some(channel.peer_id()))
-            }
-        };
-
-        let packet = tl_proto::deserialize::<proto::IncomingPacketContents>(src);
-
-        todo!()
-    }
-}
-
-#[derive(Copy, Clone)]
-enum PacketSource {
-    Handshake,
-    Channel(NodeId),
+pub struct DecodedPacket {
+    pub data: Bytes,
+    pub local_id: NodeId,
+    pub peer_id: Option<NodeId>,
 }
 
 #[derive(Copy, Clone)]
@@ -187,7 +141,7 @@ pub struct HandshakeEncoder<'a> {
 
 impl HandshakeEncoder<'_> {
     pub fn encode<T: TlWrite>(self, packet: &T, buffer: &mut BytesMut) {
-        let temp_secret_key = ed25519::SecretKey::generate().expand();
+        let temp_secret_key = ed25519::SecretKey::generate(&mut rand::thread_rng()).expand();
         let temp_public_key = ed25519::PublicKey::from(&temp_secret_key);
         let shared_secret = temp_secret_key.compute_shared_secret(self.peer_public_key);
 
@@ -207,20 +161,20 @@ impl HandshakeEncoder<'_> {
 pub struct HandshakeDecoder<'a>(&'a FxHashMap<NodeId, ed25519::KeyPair>);
 
 impl<'a> HandshakeDecoder<'a> {
-    pub fn decode(self, buffer: &mut BytesMut) -> Result<Option<&'a NodeId>, HandshakeError> {
+    pub fn decode(self, buffer: &mut BytesMut) -> Result<Option<DecodedPacket>, HandshakeError> {
         if buffer.len() < 96 {
             return Err(HandshakeError::PacketTooSmall);
         }
 
-        let peer_id_short = &buffer[..32];
+        let target_id = &buffer[..32];
         let temp_public_key =
             match ed25519::PublicKey::from_bytes(buffer[32..64].try_into().unwrap()) {
                 Some(public_key) => public_key,
                 None => return Err(HandshakeError::InvalidPublicKey),
             };
 
-        for (local_peer_id_short, key) in self.0 {
-            if local_peer_id_short == peer_id_short {
+        for (local_id, key) in self.0 {
+            if local_id == target_id {
                 let shared_secret = key.secret_key.compute_shared_secret(&temp_public_key);
 
                 let checksum: [u8; 32] = buffer[64..96].try_into().unwrap();
@@ -231,7 +185,12 @@ impl<'a> HandshakeDecoder<'a> {
                 }
 
                 buffer.advance(96);
-                return Ok(Some(local_peer_id_short));
+
+                return Ok(Some(DecodedPacket {
+                    data: buffer.split().freeze(),
+                    local_id: *local_id,
+                    peer_id: None,
+                }));
             }
         }
 
@@ -260,7 +219,7 @@ impl ChannelEncoder<'_> {
 pub struct ChannelDecoder<'a>(&'a FxHashMap<ChannelId, Arc<Channel>>);
 
 impl<'a> ChannelDecoder<'a> {
-    pub fn decode(self, buffer: &mut BytesMut) -> Result<&'a Channel, ChannelError> {
+    pub fn decode(self, buffer: &mut BytesMut) -> Result<DecodedPacket, ChannelError> {
         if buffer.len() < 64 {
             return Err(ChannelError::PacketTooSmall);
         }
@@ -282,19 +241,29 @@ impl<'a> ChannelDecoder<'a> {
         }
 
         buffer.advance(64);
-        Ok(channel)
+
+        channel.set_ready();
+        channel.reset_drop_timeout();
+
+        Ok(DecodedPacket {
+            data: buffer.split().freeze(),
+            local_id: *channel.local_id(),
+            peer_id: Some(*channel.peer_id()),
+        })
     }
 }
 
-fn build_packet_cipher(shared_secret: &[u8; 32], checksum: &[u8; 32]) -> aes::Aes256Ctr {
-    use aes::cipher::NewCipher;
+type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
+
+fn build_packet_cipher(shared_secret: &[u8; 32], checksum: &[u8; 32]) -> Aes256Ctr {
+    use aes::cipher::KeyIvInit;
 
     let mut aes_key_bytes: [u8; 32] = *shared_secret;
     aes_key_bytes[16..32].copy_from_slice(&checksum[16..32]);
     let mut aes_ctr_bytes: [u8; 16] = checksum[..16].try_into().unwrap();
     aes_ctr_bytes[4..16].copy_from_slice(&shared_secret[20..32]);
 
-    aes::Aes256Ctr::new(
+    Aes256Ctr::new(
         &generic_array::GenericArray::from(aes_key_bytes),
         &generic_array::GenericArray::from(aes_ctr_bytes),
     )
@@ -351,38 +320,14 @@ impl TlPacket for PacketHasher {
 
 #[derive(thiserror::Error, Debug)]
 pub enum CodecError {
-    #[error("invalid packet")]
-    InvalidPacket(ValidationError),
     #[error("invalid handshake packet")]
     InvalidHandshakePacket(#[from] HandshakeError),
     #[error("invalid channel packet")]
     InvalidChannelPacket(#[from] ChannelError),
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ValidationError {
-    #[error("explicit source public key inside channel packet")]
-    ExplicitSourceForChannel,
-    #[error("invalid peer public key")]
-    InvalidPeerPublicKey,
-    #[error("invalid address list")]
-    InvalidAddressList(#[from] AddressListError),
-    #[error("peer id mismatch (from / from_short)")]
-    PeerIdMismatch,
-    #[error("no peer data in packet")]
-    NoPeerDataInPacket,
-    #[error("peer channel not found")]
-    PeerChannelNotFound,
+    #[error("local peer not found")]
+    LocalPeerNotFound,
     #[error("peer not found")]
     PeerNotFound,
-    #[error("local reinit date is too new")]
-    LocalReinitDateTooNew,
-    #[error("local reinit date is too old")]
-    LocalReinitDateTooOld,
-    #[error("peer reinit date is too old")]
-    PeerReinitDateTooOld,
-    #[error("peer reinit date is too new")]
-    PeerReinitDateTooNew,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -404,3 +349,5 @@ pub enum ChannelError {
     #[error("bad channel packet checksum")]
     InvalidChecksum,
 }
+
+type FxDashMap<K, V> = DashMap<K, V, BuildHasherDefault<rustc_hash::FxHasher>>;

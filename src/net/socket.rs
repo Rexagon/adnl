@@ -9,18 +9,18 @@ pub enum SocketBuilder {
 }
 
 impl SocketBuilder {
-    pub fn build(self, port: u16) -> Result<UdpSocket, SocketError> {
+    pub fn build(self, port: u16) -> Result<UdpSocket, SocketBuilderError> {
         let addr = match self {
             Self::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             Self::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
 
         let udp_socket =
-            std::net::UdpSocket::bind((addr, port)).map_err(SocketError::BindFailed)?;
+            std::net::UdpSocket::bind((addr, port)).map_err(SocketBuilderError::BindFailed)?;
 
         udp_socket
             .set_nonblocking(true)
-            .map_err(SocketError::ConfigurationFailed)?;
+            .map_err(SocketBuilderError::ConfigurationFailed)?;
 
         #[cfg(unix)]
         {
@@ -31,7 +31,7 @@ impl SocketBuilder {
             set_reuse_port(fd, true)?;
         }
 
-        UdpSocket::from_std(udp_socket).map_err(SocketError::InvalidSocket)
+        UdpSocket::from_std(udp_socket).map_err(SocketBuilderError::InvalidSocket)
     }
 }
 
@@ -45,7 +45,7 @@ impl From<SocketBuilder> for IpAddr {
 }
 
 #[cfg(unix)]
-fn set_reuse_port(socket: libc::c_int, reuse: bool) -> Result<(), SocketError> {
+fn set_reuse_port(socket: libc::c_int, reuse: bool) -> Result<(), SocketBuilderError> {
     unsafe {
         setsockopt(
             socket,
@@ -57,7 +57,7 @@ fn set_reuse_port(socket: libc::c_int, reuse: bool) -> Result<(), SocketError> {
 }
 
 #[cfg(unix)]
-fn maximise_recv_buffer(socket: libc::c_int) -> Result<(), SocketError> {
+fn maximise_recv_buffer(socket: libc::c_int) -> Result<(), SocketBuilderError> {
     const MAX_UDP_RECV_BUFFER_SIZE: usize = 1 << 24;
 
     unsafe {
@@ -86,7 +86,7 @@ unsafe fn getsockopt<T>(
     socket: libc::c_int,
     level: libc::c_int,
     optname: libc::c_int,
-) -> Result<T, SocketError>
+) -> Result<T, SocketBuilderError>
 where
     T: Copy,
 {
@@ -109,7 +109,7 @@ unsafe fn setsockopt<T>(
     level: libc::c_int,
     name: libc::c_int,
     value: T,
-) -> Result<(), SocketError>
+) -> Result<(), SocketBuilderError>
 where
     T: Copy,
 {
@@ -125,9 +125,9 @@ where
 }
 
 #[cfg(unix)]
-fn cvt(res: libc::c_int) -> Result<(), SocketError> {
+fn cvt(res: libc::c_int) -> Result<(), SocketBuilderError> {
     if res == -1 {
-        Err(SocketError::ConfigurationFailed(
+        Err(SocketBuilderError::ConfigurationFailed(
             std::io::Error::last_os_error(),
         ))
     } else {
@@ -136,7 +136,7 @@ fn cvt(res: libc::c_int) -> Result<(), SocketError> {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum SocketError {
+pub enum SocketBuilderError {
     #[error("failed to bind UDP port")]
     BindFailed(#[source] std::io::Error),
     #[error("failed to configure udp socket")]

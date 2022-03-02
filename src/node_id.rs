@@ -1,7 +1,5 @@
+use everscale_crypto::ed25519;
 use sha2::{Digest, Sha256};
-
-pub mod ed25519;
-// TODO: Add AES
 
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct NodeId([u8; 32]);

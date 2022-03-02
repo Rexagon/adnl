@@ -1,3 +1,4 @@
+use everscale_crypto::tl::PublicKey;
 use smallvec::SmallVec;
 use tl_proto::*;
 
@@ -12,7 +13,7 @@ pub struct OutgoingPacketContents<'tl> {
     pub address: AddressList<'tl>,
     pub seqno: u64,
     pub confirm_seqno: u64,
-    pub reinit_dates: Option<(u32, u32)>,
+    pub reinit_dates: Option<ReinitDates>,
     /// 3 or 7 random bytes
     pub rand2: &'tl [u8],
 }
@@ -75,7 +76,9 @@ pub struct IncomingPacketContents<'tl> {
     pub seqno: Option<u64>,
     pub confirm_seqno: Option<u64>,
 
-    pub reinit_dates: Option<(u32, u32)>,
+    pub reinit_dates: Option<ReinitDates>,
+
+    pub signature: Option<IncomingPacketContentsSignature>,
 }
 
 impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
@@ -99,7 +102,9 @@ impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
 
         <&[u8] as TlRead>::read_from(packet, offset)?; // rand1
 
+        let flags_offset = *offset as u16;
         let flags = u32::read_from(packet, offset)?;
+
         let from = read_optional::<PublicKey, 0>(flags, packet, offset)?;
         let from_short = read_optional::<HashRef, 1>(flags, packet, offset)?;
 
@@ -115,9 +120,27 @@ impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
         read_optional::<u32, 8>(flags, packet, offset)?; // recv_addr_list_version
         read_optional::<u32, 9>(flags, packet, offset)?; // recv_priority_addr_list_version
 
-        let reinit_dates = read_optional::<(u32, u32), 10>(flags, packet, offset)?;
+        let reinit_dates = read_optional::<ReinitDates, 10>(flags, packet, offset)?;
 
-        read_optional::<&[u8], 11>(flags, packet, offset)?; // signature
+        let signature = if flags & (0b1 << 11) != 0 {
+            let signature_start = *offset as u16;
+            let signature = <&[u8]>::read_from(packet, offset)?;
+            let signature_end = *offset as u16;
+
+            if signature.len() != 64 {
+                return Err(TlError::UnexpectedEof);
+            }
+
+            Some(IncomingPacketContentsSignature {
+                signature: signature.try_into().unwrap(),
+                flags_offset,
+                signature_start,
+                signature_end,
+            })
+        } else {
+            None
+        };
+
         <&[u8] as TlRead>::read_from(packet, offset)?; // rand2
 
         Ok(Self {
@@ -140,8 +163,77 @@ impl<'tl> TlRead<'tl> for IncomingPacketContents<'tl> {
             seqno,
             confirm_seqno,
             reinit_dates,
+            signature,
         })
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct IncomingPacketContentsSignature {
+    signature: [u8; 64],
+    flags_offset: u16,
+    signature_start: u16,
+    signature_end: u16,
+}
+
+impl IncomingPacketContentsSignature {
+    pub fn extract(self, packet: &mut [u8]) -> Result<(&mut [u8], [u8; 64]), PacketContentsError> {
+        let origin = packet.as_ptr() as *mut u8;
+
+        // `packet` before:
+        // [............_*__.................|__________________|.........]
+        // flags_offset ^     signature_start ^    signature_end ^
+
+        // NOTE: `flags_offset + 1` is used because flags are stored in LE bytes order and
+        // we need the second byte (signature mask - 0x0800)
+        let flags_offset = (self.flags_offset + 1) as usize;
+
+        let (signature_len, remaining) = match (packet.len(), flags_offset) {
+            (packet_len, flags_offset)
+                if flags_offset < packet_len
+                    && self.signature_start < self.signature_end
+                    && (self.signature_end as usize) < packet_len =>
+            {
+                packet[flags_offset] &= 0b11110111; // reset signature bit
+
+                (
+                    self.signature_end - self.signature_start, // signature len
+                    packet_len - self.signature_end as usize,  // remaining
+                )
+            }
+            _ => return Err(PacketContentsError::InvalidSignature),
+        };
+
+        // SAFETY: `signature_end` and `signature_start` are guaranteed
+        // to be in the packet bounds
+        let packet = unsafe {
+            let src = origin.add(self.signature_end as usize);
+            let dst = origin.add(self.signature_start as usize);
+            // Copy packet tail over the signature
+            std::ptr::copy(src, dst, remaining);
+            // Shrink the packet
+            std::slice::from_raw_parts_mut(origin, packet.len() - signature_len as usize)
+        };
+
+        // `packet` after:
+        // [............_0__.................||.........]-----removed-----]
+        // flags_offset ^     signature_start ^
+
+        Ok((packet, self.signature))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PacketContentsError {
+    #[error("invalid signature")]
+    InvalidSignature,
+}
+
+#[derive(Debug, Copy, Clone, TlWrite, TlRead)]
+#[tl(size_hint = 8)]
+pub struct ReinitDates {
+    pub local: u32,
+    pub target: u32,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -215,19 +307,6 @@ pub enum Address<'tl> {
         to: HashRef<'tl>,
         pubkey: PublicKey<'tl>,
     },
-}
-
-#[derive(Debug, Copy, Clone, TlRead, TlWrite)]
-#[tl(boxed)]
-pub enum PublicKey<'tl> {
-    #[tl(id = 0x4813b4c6, size_hint = 32)]
-    Ed25519 { key: HashRef<'tl> },
-    #[tl(id = 0x34ba45cb)]
-    Overlay { name: &'tl [u8] },
-    #[tl(id = 0x2dbcadd4, size_hint = 32)]
-    Aes { key: HashRef<'tl> },
-    #[tl(id = 0xb61f450a)]
-    Unencoded { data: &'tl [u8] },
 }
 
 #[derive(Debug, Copy, Clone, TlRead, TlWrite)]

@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use everscale_crypto::ed25519;
 use sha2::{Digest, Sha256};
 use tl_proto::HashWrapper;
 
-use crate::keys::*;
-use crate::proto;
+use crate::node_id::*;
 
 pub type ChannelId = [u8; 32];
 
@@ -14,6 +14,7 @@ pub struct Channel {
     outgoing: ChannelSide,
     local_id: NodeId,
     peer_id: NodeId,
+    peer_channel_public_key: [u8; 32],
     peer_channel_date: u32,
     drop: AtomicI32,
 }
@@ -22,12 +23,13 @@ impl Channel {
     pub fn new(
         local_id: NodeId,
         peer_id: NodeId,
-        channel_key: &ed25519::ExpandedSecretKey,
-        other_public_key: &ed25519::PublicKey,
+        channel_key: &ed25519::KeyPair,
         peer_channel_date: u32,
         context: AdnlChannelCreationContext,
     ) -> Self {
-        let shared_secret = channel_key.compute_shared_secret(other_public_key);
+        let shared_secret = channel_key
+            .secret_key
+            .compute_shared_secret(&channel_key.public_key);
         let mut reversed_secret = shared_secret;
         reversed_secret.reverse();
 
@@ -43,6 +45,7 @@ impl Channel {
             outgoing: ChannelSide::from_secret(out_secret),
             local_id,
             peer_id,
+            peer_channel_public_key: channel_key.public_key.to_bytes(),
             peer_channel_date,
             drop: Default::default(),
         }
@@ -76,6 +79,16 @@ impl Channel {
     #[inline(always)]
     pub fn reset_drop_timeout(&self) {
         self.drop.store(0, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn key(&self) -> &[u8; 32] {
+        &self.peer_channel_public_key
+    }
+
+    #[inline(always)]
+    pub fn is_still_valid(&self, time: u32) -> bool {
+        self.peer_channel_date >= time
     }
 }
 
@@ -112,6 +125,6 @@ impl std::fmt::Display for AdnlChannelCreationContext {
 #[inline(always)]
 fn compute_channel_id(key: &[u8; 32]) -> ChannelId {
     let mut h = Sha256::new();
-    HashWrapper(proto::PublicKey::Aes { key }).update_hasher(&mut h);
+    HashWrapper(everscale_crypto::tl::PublicKey::Aes { key }).update_hasher(&mut h);
     h.finalize().into()
 }

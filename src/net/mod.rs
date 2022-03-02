@@ -1,175 +1,114 @@
-use std::borrow::Borrow;
 use std::mem::MaybeUninit;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use bytes::{BufMut, BytesMut};
-use futures::{Sink, Stream};
-use tokio::io::ReadBuf;
+use bytes::{Buf, BufMut, BytesMut};
+use tl_proto::TlWrite;
 use tokio::net::UdpSocket;
 
-pub mod address;
-pub mod socket;
+pub use self::address::*;
+pub use self::socket::*;
 
-pub trait Encoder<Item> {
-    fn encode(&mut self, item: Item, dst: &mut BytesMut);
-}
+mod address;
+mod socket;
 
 pub trait Decoder {
     type Item;
     type Error: std::fmt::Debug;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Self::Item, Self::Error>;
+    fn decode(&self, src: &mut BytesMut) -> Result<Self::Item, Self::Error>;
 }
 
-pub struct UdpFramed<C, T = UdpSocket> {
-    socket: T,
-    codec: C,
-    rd: BytesMut,
-    wr: BytesMut,
-    out_addr: SocketAddr,
-    flushed: bool,
-    is_readable: bool,
+pub struct UdpSender {
+    socket: Arc<UdpSocket>,
+    rw: BytesMut,
 }
 
-impl<C, T> UdpFramed<C, T>
-where
-    T: Borrow<UdpSocket>,
-{
-    pub fn new(socket: T, codec: C) -> Self {
+impl UdpSender {
+    pub fn new(socket: Arc<UdpSocket>) -> Self {
         Self {
             socket,
-            codec,
-            rd: BytesMut::with_capacity(INITIAL_RD_CAPACITY),
-            wr: BytesMut::with_capacity(INITIAL_WR_CAPACITY),
-            out_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            flushed: true,
-            is_readable: false,
+            rw: BytesMut::with_capacity(INITIAL_WR_CAPACITY),
         }
     }
-}
 
-impl<C, T> Unpin for UdpFramed<C, T> {}
-
-impl<C, T> Stream for UdpFramed<C, T>
-where
-    C: Decoder,
-    T: Borrow<UdpSocket>,
-{
-    type Item = Result<C::Item, NetworkError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let pin = self.get_mut();
-
-        pin.rd.reserve(INITIAL_RD_CAPACITY);
-
-        loop {
-            if pin.is_readable {
-                match pin.codec.decode(&mut pin.rd) {
-                    Ok(frame) => return Poll::Ready(Some(Ok(frame))),
-                    Err(e) => {
-                        log::debug!("got invalid packet: {:?}", e);
-                    }
-                }
-
-                pin.is_readable = false;
-                pin.rd.clear();
-            }
-
-            unsafe {
-                // Convert `&mut [MaybeUninit<u8>]` to `&mut [u8]` because we will be
-                // writing to it via `poll_recv_from` and therefore initializing the memory.
-                let buf = &mut *(pin.rd.chunk_mut() as *mut _ as *mut [MaybeUninit<u8>]);
-
-                let mut read = ReadBuf::uninit(buf);
-                futures::ready!(pin.socket.borrow().poll_recv_from(cx, &mut read))
-                    .map_err(NetworkError::PacketReceiveError)?;
-
-                pin.rd.advance_mut(read.filled().len());
-            }
-
-            pin.is_readable = true;
-        }
-    }
-}
-
-impl<I, C, T> Sink<(I, SocketAddr)> for UdpFramed<C, T>
-where
-    C: Encoder<I>,
-    T: Borrow<UdpSocket>,
-{
-    type Error = NetworkError;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if !self.flushed {
-            match self.poll_flush(cx)? {
-                Poll::Ready(()) => {}
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        Poll::Ready(Ok(()))
+    #[inline(always)]
+    pub fn acquire_buffer(&mut self) -> UdpSenderBuffer {
+        UdpSenderBuffer(&mut self.rw)
     }
 
-    fn start_send(self: Pin<&mut Self>, item: (I, SocketAddr)) -> Result<(), Self::Error> {
-        let (frame, out_addr) = item;
-
-        let pin = self.get_mut();
-
-        pin.codec.encode(frame, &mut pin.wr);
-        pin.out_addr = out_addr;
-        pin.flushed = false;
-
+    pub async fn flush(&self, to: SocketAddr) -> Result<(), std::io::Error> {
+        self.socket.send_to(&self.rw, to).await?;
         Ok(())
     }
+}
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.flushed {
-            return Poll::Ready(Ok(()));
+pub struct UdpSenderBuffer<'a>(&'a mut BytesMut);
+
+impl UdpSenderBuffer<'_> {
+    #[inline(always)]
+    pub fn write<T: TlWrite>(self, data: T) {
+        self.0.clear();
+        data.write_to(self.0);
+    }
+}
+
+pub struct UdpReceiver<C> {
+    socket: Arc<UdpSocket>,
+    decoder: C,
+    rd: BytesMut,
+}
+
+impl<C> UdpReceiver<C>
+where
+    C: Decoder,
+{
+    pub fn new(socket: Arc<UdpSocket>, decoder: C) -> Self {
+        Self {
+            socket,
+            decoder,
+            rd: BytesMut::with_capacity(RECV_BUFFER_CHUNK_SIZE),
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<C::Item, std::io::Error> {
+        if self.rd.remaining() < RECV_BUFFER_SIZE {
+            // Create new bytes instance
+            self.rd = BytesMut::with_capacity(RECV_BUFFER_CHUNK_SIZE);
+        } else {
+            // Clear existing bytes instance
+            self.rd.clear();
         }
 
-        let Self {
-            ref socket,
-            ref mut out_addr,
-            ref mut wr,
-            ..
-        } = *self;
+        loop {
+            // SAFETY: Convert `&mut [MaybeUninit<u8>]` to `&mut [u8]` because we will be
+            // writing to it via `poll_recv_from` and therefore initializing the memory.
+            let mut buf = unsafe {
+                &mut *(self.rd.chunk_mut() as *mut _ as *mut [MaybeUninit<u8>] as *mut [u8])
+            };
+            if buf.len() > RECV_BUFFER_SIZE {
+                buf = &mut buf[..RECV_BUFFER_SIZE];
+            }
 
-        let n = futures::ready!(socket.borrow().poll_send_to(cx, wr, *out_addr))
-            .map_err(NetworkError::PacketSendError)?;
+            let len = self.socket.recv(buf).await?;
+            if len == 0 {
+                continue;
+            }
 
-        let wrote_all = n == self.wr.len();
-        self.wr.clear();
-        self.flushed = true;
+            // SAFETY: `len` bytes were definitely initialized by `recv` method
+            unsafe { self.rd.advance_mut(len) };
 
-        let res = if wrote_all {
-            Ok(())
-        } else {
-            Err(NetworkError::PartialSend)
-        };
-
-        Poll::Ready(res)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        futures::ready!(self.poll_flush(cx))?;
-        Poll::Ready(Ok(()))
+            if let Ok(item) = self.decoder.decode(&mut self.rd) {
+                return Ok(item);
+            }
+        }
     }
 }
 
-const INITIAL_RD_CAPACITY: usize = 64 * 1024;
+const RECV_BUFFER_CHUNK_SIZE: usize = 64 * 1024;
+const RECV_BUFFER_SIZE: usize = 2 * 1024;
+
 const INITIAL_WR_CAPACITY: usize = 8 * 1024;
-
-#[derive(thiserror::Error, Debug)]
-pub enum NetworkError {
-    #[error("failed to write entire datagram to socket")]
-    PartialSend,
-    #[error("failed to receive datagram")]
-    PacketReceiveError(#[source] std::io::Error),
-    #[error("failed to send datagram")]
-    PacketSendError(#[source] std::io::Error),
-}
 
 #[cfg(test)]
 mod tests {
