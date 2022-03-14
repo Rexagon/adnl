@@ -33,9 +33,33 @@ impl CodecState {
             .get(local_id)
             .ok_or(CodecError::LocalPeerNotFound)?;
 
-        let entry = entry.peers.get(peer_id).ok_or(CodecError::PeerNotFound)?;
+        let peer = entry.peers.get(peer_id).ok_or(CodecError::PeerNotFound)?;
 
-        Ok(entry.value().clone())
+        Ok(peer.value().clone())
+    }
+
+    pub fn get_packet_encoder(
+        &self,
+        local_id: &NodeId,
+        peer_id: &NodeId,
+    ) -> Result<PacketEncoder, CodecError> {
+        let connections = self.connections.read();
+
+        let entry = connections
+            .get(local_id)
+            .ok_or(CodecError::LocalPeerNotFound)?;
+
+        let peer = {
+            let entry = entry.peers.get(peer_id).ok_or(CodecError::PeerNotFound)?;
+            entry.value().clone()
+        };
+
+        let data = match entry.channels_by_peers.get(peer_id) {
+            Some(channel) => PacketEncoderData::Channel(channel.value().clone()),
+            None => PacketEncoderData::Handshake(entry.key.clone()),
+        };
+
+        Ok(PacketEncoder { peer, data })
     }
 
     pub fn update_peer(
@@ -87,17 +111,17 @@ impl Default for CodecOptions {
 
 pub struct ConnectionsEntry {
     /// Local key
-    pub key: ed25519::KeyPair,
+    pub key: Arc<ed25519::KeyPair>,
     /// Remote peers
     pub peers: FxDashMap<NodeId, Arc<Peer>>,
     /// Peer channels
     pub channels_by_peers: FxDashMap<NodeId, Arc<Channel>>,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct PacketToSend<'a> {
     contents: &'a proto::OutgoingPacketContents<'a>,
-    encoder: PacketEncoder<'a>,
+    encoder: PacketEncoder,
 }
 
 // impl<'a> Encoder<PacketToSend<'a>> for Codec {
@@ -127,10 +151,16 @@ pub struct DecodedPacket {
     pub peer_id: Option<NodeId>,
 }
 
-#[derive(Copy, Clone)]
-pub enum PacketEncoder<'a> {
-    Handshake(HandshakeEncoder<'a>),
-    Channel(ChannelEncoder<'a>),
+#[derive(Clone)]
+pub struct PacketEncoder {
+    pub peer: Arc<Peer>,
+    pub data: PacketEncoderData,
+}
+
+#[derive(Clone)]
+pub enum PacketEncoderData {
+    Handshake(Arc<ed25519::KeyPair>),
+    Channel(Arc<Channel>),
 }
 
 #[derive(Copy, Clone)]

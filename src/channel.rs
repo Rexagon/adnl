@@ -72,6 +72,11 @@ impl Channel {
     }
 
     #[inline(always)]
+    pub fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
     pub fn set_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
@@ -84,6 +89,11 @@ impl Channel {
     #[inline(always)]
     pub fn key(&self) -> &[u8; 32] {
         &self.peer_channel_public_key
+    }
+
+    #[inline(always)]
+    pub fn peer_date(&self) -> u32 {
+        self.peer_channel_date
     }
 
     #[inline(always)]
